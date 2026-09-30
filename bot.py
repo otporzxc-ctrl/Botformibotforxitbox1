@@ -1,269 +1,620 @@
-import os, math, json, asyncio, tempfile, subprocess
+import os
+import json
+import asyncio
+import tempfile
+import subprocess
+
 from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 TOKEN = os.environ["BOT_TOKEN"]
 BANNER = "/app/banner.mp4"
-ALLOWED_USERS = set(map(int, os.environ.get("ALLOWED_USERS","").split(","))) \
-    if os.environ.get("ALLOWED_USERS") else set()
-SEMAPHORE = asyncio.Semaphore(1)
+
+ALLOWED_USERS = set(
+    map(int, os.environ.get("ALLOWED_USERS", "").split(","))
+) if os.environ.get("ALLOWED_USERS") else set()
+
 BANNER_DUR = 4.4
-MAX_DUR = 120
 FPS = 30
 
 
-def run(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+def run(cmd, timeout=3600):
+    r = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
     return r.returncode == 0, r.stderr
 
 
-def info(path):
-    r = subprocess.run([
-        "ffprobe","-v","quiet","-print_format","json",
-        "-show_streams","-show_format", path
-    ], capture_output=True, text=True)
+def get_info(path):
+    r = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-show_format",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
     try:
-        d = json.loads(r.stdout)
-    except:
+        data = json.loads(r.stdout)
+    except Exception:
         return None
-    out = {"dur":0,"w":1280,"h":720,"audio":False}
-    for s in d.get("streams",[]):
-        if s["codec_type"]=="video":
-            out["dur"] = float(s.get("duration") or d.get("format",{}).get("duration",0))
-            out["w"] = int(s.get("width",1280))
-            out["h"] = int(s.get("height",720))
-        elif s["codec_type"]=="audio":
-            out["audio"] = True
-    if not out["dur"]:
-        out["dur"] = float(d.get("format",{}).get("duration",0))
-    return out if out["dur"]>0 else None
+
+    duration = float(data.get("format", {}).get("duration", 0) or 0)
+    width = 1280
+    height = 720
+    audio = False
+
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            width = int(stream.get("width", 1280))
+            height = int(stream.get("height", 720))
+
+            if not duration:
+                duration = float(stream.get("duration", 0) or 0)
+
+        elif stream.get("codec_type") == "audio":
+            audio = True
+
+    if duration <= 0:
+        return None
+
+    return {
+        "duration": duration,
+        "width": width,
+        "height": height,
+        "audio": audio,
+    }
 
 
-def prepare(src, tmp, inf):
-    out = os.path.join(tmp,"prep.mp4")
-    W,H = inf["w"],inf["h"]
-    if H >= W:
-        vf = "scale=576:1024:force_original_aspect_ratio=increase,crop=576:1024"
-        cmd = ["ffmpeg","-y","-i",src,"-vf",vf,"-r",str(FPS),
-               "-c:v","libx264","-preset","ultrafast","-crf","28",
-               "-c:a","aac","-b:a","128k","-movflags","+faststart",out]
+def prepare_video(src, tmp):
+    """
+    Приводим видео к 576x1024.
+
+    Вертикальное:
+        заполняет весь экран.
+
+    Горизонтальное:
+        размытый фон + исходное видео по центру.
+    """
+
+    out = os.path.join(tmp, "prepared.mp4")
+
+    info = get_info(src)
+
+    if not info:
+        return None, "Не удалось прочитать видео"
+
+    w = info["width"]
+    h = info["height"]
+
+    if h >= w:
+
+        vf = (
+            "scale=576:1024:"
+            "force_original_aspect_ratio=increase,"
+            "crop=576:1024"
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", src,
+            "-vf", vf,
+            "-r", str(FPS),
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            out,
+        ]
+
     else:
-        oh = int(576*H/W)
-        oy = (1024-oh)//2
-        fc = (f"[0:v]split=2[bg][fg];"
-              f"[bg]scale=576:1024:force_original_aspect_ratio=increase,"
-              f"crop=576:1024,gblur=sigma=30[bl];"
-              f"[fg]scale=576:{oh}[or];"
-              f"[bl][or]overlay=0:{oy}[v]")
-        cmd = ["ffmpeg","-y","-i",src,"-filter_complex",fc,
-               "-map","[v]","-map","0:a?","-r",str(FPS),
-               "-c:v","libx264","-preset","ultrafast","-crf","28",
-               "-c:a","aac","-b:a","128k","-movflags","+faststart",out]
-    ok,err = run(cmd)
-    return (out,None) if ok else (None,err[-300:])
+
+        foreground_h = int(576 * h / w)
+        foreground_h = max(1, foreground_h)
+
+        y = max(0, (1024 - foreground_h) // 2)
+
+        filter_complex = (
+            "[0:v]split=2[bg][fg];"
+            "[bg]"
+            "scale=576:1024:"
+            "force_original_aspect_ratio=increase,"
+            "crop=576:1024,"
+            "gblur=sigma=30[blur];"
+            f"[fg]scale=576:{foreground_h}[main];"
+            f"[blur][main]overlay=0:{y}[v]"
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", src,
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "0:a?",
+            "-r", str(FPS),
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            out,
+        ]
+
+    ok, err = run(cmd)
+
+    if not ok:
+        return None, err[-1000:]
+
+    return out, None
 
 
-def cut(src, start, end, out):
-    dur = round(end-start, 3)
-    ok,err = run([
-        "ffmpeg","-y",
-        "-ss",str(start),"-i",src,
-        "-t",str(dur),
-        "-c:v","libx264","-preset","ultrafast","-crf","28",
-        "-r",str(FPS),
-        "-c:a","aac","-b:a","128k",
-        "-avoid_negative_ts","make_zero",
-        "-movflags","+faststart", out
-    ])
-    return ok, err[-200:]
+def cut_video(src, start, end, out):
+    duration = max(0.001, end - start)
+
+    ok, err = run(
+        [
+            "ffmpeg", "-y",
+            "-ss", f"{start:.3f}",
+            "-i", src,
+            "-t", f"{duration:.3f}",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-r", str(FPS),
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-avoid_negative_ts", "make_zero",
+            out,
+        ]
+    )
+
+    return ok, err[-1000:]
 
 
-def make_freeze(src, at, out):
+def make_freeze_frame(src, position, out):
     """
-    Вытаскиваем один кадр и зацикливаем его на BANNER_DUR секунд.
-    Без звука — звук будет от баннера.
+    Берём кадр непосредственно в момент появления баннера.
     """
+
     frames = int(BANNER_DUR * FPS) + 2
-    ok,err = run([
-        "ffmpeg","-y",
-        "-ss",str(at),"-i",src,
-        "-vf",f"select='eq(n,0)',loop={frames}:1:0,trim=duration={BANNER_DUR},setpts=PTS-STARTPTS",
-        "-r",str(FPS),
-        "-an",
-        "-c:v","libx264","-preset","ultrafast","-crf","28",
-        "-movflags","+faststart", out
-    ])
-    return ok, err[-200:]
+
+    ok, err = run(
+        [
+            "ffmpeg", "-y",
+            "-ss", f"{position:.3f}",
+            "-i", src,
+            "-vf",
+            (
+                "select='eq(n,0)',"
+                f"loop={frames}:1:0,"
+                f"trim=duration={BANNER_DUR},"
+                "setpts=PTS-STARTPTS"
+            ),
+            "-r", str(FPS),
+            "-an",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            out,
+        ]
+    )
+
+    return ok, err[-1000:]
 
 
-def make_banner_over_freeze(freeze_vid, out):
+def make_banner(freeze, out):
     """
-    Накладываем баннер (с хрома-кеем) поверх замороженного кадра.
-    Звук берём от баннера.
+    Накладываем banner.mp4 на стоп-кадр.
     """
-    bw = 576
-    bh = int(576/(1350/750))
-    bx = (576-bw)//2
-    by = (1024-bh)//2
 
-    ok,err = run([
-        "ffmpeg","-y",
-        "-i", freeze_vid,
-        "-i", BANNER,
-        "-filter_complex",
-        (f"[1:v]trim=duration={BANNER_DUR},setpts=PTS-STARTPTS,"
-         f"scale={bw}:{bh},"
-         f"chromakey=color=00FF00:similarity=0.30:blend=0.05[ban];"
-         f"[0:v]trim=duration={BANNER_DUR},setpts=PTS-STARTPTS[base];"
-         f"[base][ban]overlay={bx}:{by}[v]"),
-        "-map","[v]",
-        "-map","1:a",
-        "-t",str(BANNER_DUR),
-        "-r",str(FPS),
-        "-c:v","libx264","-preset","ultrafast","-crf","28",
-        "-c:a","aac","-b:a","128k",
-        "-movflags","+faststart", out
-    ])
-    return ok, err[-200:]
+    banner_width = 576
+    banner_height = 320
 
+    x = 0
+    y = (1024 - banner_height) // 2
 
-def concat(files, out):
-    lst = out+"_list.txt"
-    with open(lst,"w") as f:
-        for p in files:
-            f.write(f"file '{p}'\n")
-    ok,err = run([
-        "ffmpeg","-y",
-        "-f","concat","-safe","0","-i",lst,
-        "-c:v","libx264","-preset","ultrafast","-crf","28",
-        "-r",str(FPS),
-        "-c:a","aac","-b:a","128k",
-        "-movflags","+faststart", out
-    ])
-    try: os.remove(lst)
-    except: pass
-    return ok, err[-200:]
+    filter_complex = (
+        "[1:v]"
+        f"scale={banner_width}:{banner_height},"
+        "trim=duration=4.4,"
+        "setpts=PTS-STARTPTS,"
+        "chromakey=0x00FF00:0.30:0.05[ban];"
+        "[0:v]"
+        "trim=duration=4.4,"
+        "setpts=PTS-STARTPTS[base];"
+        f"[base][ban]overlay={x}:{y}[v]"
+    )
+
+    ok, err = run(
+        [
+            "ffmpeg", "-y",
+            "-i", freeze,
+            "-i", BANNER,
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "1:a?",
+            "-t", str(BANNER_DUR),
+            "-r", str(FPS),
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            out,
+        ]
+    )
+
+    return ok, err[-1000:]
 
 
-def process(src, dst):
+def concat_videos(files, output):
+    list_file = output + ".txt"
+
+    with open(list_file, "w", encoding="utf-8") as f:
+        for file in files:
+            path = os.path.abspath(file).replace("\\", "/")
+            path = path.replace("'", "'\\''")
+            f.write(f"file '{path}'\n")
+
+    ok, err = run(
+        [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-r", str(FPS),
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            output,
+        ]
+    )
+
+    try:
+        os.remove(list_file)
+    except OSError:
+        pass
+
+    return ok, err[-1000:]
+
+
+def banner_positions(duration):
+    """
+    ВАЖНО:
+    
+    <= 60 секунд:
+        один баннер по центру.
+
+    > 60 секунд:
+        00:20
+        01:20
+        02:20
+        03:20
+        ...
+
+    То есть 15 минут:
+        00:20 ... 14:20
+    """
+
+    if duration <= 60:
+        return [round(duration / 2, 3)]
+
+    positions = []
+
+    position = 20.0
+
+    while position + BANNER_DUR < duration:
+        positions.append(round(position, 3))
+        position += 60.0
+
+    return positions
+
+
+def process_video(source, output):
     with tempfile.TemporaryDirectory() as tmp:
-        inf = info(src)
-        if not inf: return False,"Не удалось прочитать видео"
-        dur = inf["dur"]
-        if dur < 3: return False,"Видео слишком короткое"
-        if dur > MAX_DUR: return False,"Максимум 2 минуты"
 
-        prep, err = prepare(src, tmp, inf)
-        if not prep: return False, f"Подготовка: {err}"
+        info = get_info(source)
 
-        pt = round(dur/2, 3) if dur<=60 else 20.0
+        if not info:
+            return False, "Не удалось прочитать видео"
 
-        # 1. Сегмент до баннера
-        s1 = os.path.join(tmp,"s1.mp4")
-        ok,err = cut(prep, 0, pt, s1)
-        if not ok: return False,f"Сег1: {err}"
+        duration = info["duration"]
 
-        # 2. Стоп-кадр
-        frz = os.path.join(tmp,"freeze.mp4")
-        ok,err = make_freeze(prep, pt, frz)
-        if not ok: return False,f"Стоп-кадр: {err}"
+        if duration < 3:
+            return False, "Видео слишком короткое"
 
-        # 3. Баннер поверх стоп-кадра
-        ban = os.path.join(tmp,"ban.mp4")
-        ok,err = make_banner_over_freeze(frz, ban)
-        if not ok: return False,f"Баннер: {err}"
+        prepared, error = prepare_video(source, tmp)
 
-        # 4. Сегмент после баннера
-        s2 = os.path.join(tmp,"s2.mp4")
-        ok,err = cut(prep, pt, dur, s2)
-        if not ok: return False,f"Сег2: {err}"
+        if not prepared:
+            return False, f"Подготовка видео: {error}"
 
-        # 5. Склейка
-        ok,err = concat([s1, ban, s2], dst)
-        if not ok: return False,f"Склейка: {err}"
+        positions = banner_positions(duration)
 
-        # 6. Проверка
-        ri = info(dst)
-        if ri:
-            exp = round(dur+BANNER_DUR,1)
-            act = round(ri["dur"],1)
-            if abs(act-exp)>3:
-                return False,f"Длина неверная: ожидалось {exp}с, получилось {act}с"
+        if not positions:
+            return False, "Не удалось определить позиции баннеров"
 
-        return True,"ok"
+        parts = []
+        current = 0.0
+
+        for i, position in enumerate(positions):
+
+            # Видео до баннера.
+            if position > current:
+
+                before = os.path.join(
+                    tmp,
+                    f"before_{i}.mp4"
+                )
+
+                ok, error = cut_video(
+                    prepared,
+                    current,
+                    position,
+                    before
+                )
+
+                if not ok:
+                    return False, f"Сегмент {i}: {error}"
+
+                parts.append(before)
+
+            # Стоп-кадр.
+            freeze = os.path.join(
+                tmp,
+                f"freeze_{i}.mp4"
+            )
+
+            ok, error = make_freeze_frame(
+                prepared,
+                position,
+                freeze
+            )
+
+            if not ok:
+                return False, f"Стоп-кадр {i}: {error}"
+
+            # Баннер.
+            banner = os.path.join(
+                tmp,
+                f"banner_{i}.mp4"
+            )
+
+            ok, error = make_banner(
+                freeze,
+                banner
+            )
+
+            if not ok:
+                return False, f"Баннер {i}: {error}"
+
+            parts.append(banner)
+
+            # Продолжаем исходное видео после стоп-кадра.
+            current = position + BANNER_DUR
+
+        # Оставшийся конец видео.
+        if current < duration:
+
+            tail = os.path.join(
+                tmp,
+                "tail.mp4"
+            )
+
+            ok, error = cut_video(
+                prepared,
+                current,
+                duration,
+                tail
+            )
+
+            if not ok:
+                return False, f"Конец видео: {error}"
+
+            parts.append(tail)
+
+        # Финальная сборка.
+        ok, error = concat_videos(
+            parts,
+            output
+        )
+
+        if not ok:
+            return False, f"Склейка: {error}"
+
+        if not os.path.exists(output):
+            return False, "Итоговый файл не создан"
+
+        if os.path.getsize(output) == 0:
+            return False, "Итоговый файл пустой"
+
+        return True, f"Готово. Баннеров: {len(positions)}"
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    if ALLOWED_USERS and uid not in ALLOWED_USERS:
-        await update.message.reply_text("⛔ Нет доступа"); return
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user_id = update.effective_user.id
+
+    if ALLOWED_USERS and user_id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ Нет доступа")
+        return
+
     await update.message.reply_text(
-        "👋 Скидывай видео!\n\n"
-        "📌 Что делаю:\n"
-        "• Стоп-кадр в середине\n"
-        "• Баннер CSDOG поверх полностью\n"
-        "• Видео продолжается с того же места\n\n"
-        "📦 Макс: 50MB, 2 минуты"
+        "👋 Отправляй видео.\n\n"
+        "Обработка:\n"
+        "• 576×1024\n"
+        "• стоп-кадр\n"
+        "• CSDOG banner.mp4\n"
+        "• продолжение видео после баннера\n\n"
+        "Для видео > 1 минуты:\n"
+        "00:20 → 01:20 → 02:20 → 03:20 → ...\n\n"
+        "Ограничения по длительности и размеру "
+        "в коде бота отсутствуют."
     )
 
 
-async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    await update.message.reply_text(f"Твой ID: `{uid}`", parse_mode="Markdown")
+async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        f"Твой Telegram ID: {update.effective_user.id}"
+    )
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    uid = msg.from_user.id
-    if ALLOWED_USERS and uid not in ALLOWED_USERS:
-        await msg.reply_text("⛔ Нет доступа"); return
 
-    video = msg.video or msg.document
-    if not video: return
+    message = update.message
+    user_id = update.effective_user.id
 
-    if video.file_size and video.file_size > 50*1024*1024:
-        await msg.reply_text("❌ Максимум 50MB"); return
+    if ALLOWED_USERS and user_id not in ALLOWED_USERS:
+        await message.reply_text("⛔ Нет доступа")
+        return
 
-    status = await msg.reply_text("⏳ Скачиваю...")
-    async with SEMAPHORE:
-        with tempfile.TemporaryDirectory() as tmp:
-            inp = os.path.join(tmp,"input.mp4")
-            out = os.path.join(tmp,"output.mp4")
-            try:
-                f = await context.bot.get_file(video.file_id)
-                await f.download_to_drive(inp)
-            except Exception as e:
-                await status.edit_text(f"❌ Скачивание: {e}"); return
+    media = message.video or message.document
 
-            await status.edit_text("🎬 Обрабатываю...")
-            loop = asyncio.get_event_loop()
-            try:
-                ok,err = await loop.run_in_executor(None, process, inp, out)
-            except Exception as e:
-                await status.edit_text(f"❌ Ошибка: {e}"); return
+    if not media:
+        return
 
-            if not ok:
-                await status.edit_text(f"❌ {err}"); return
-            if not os.path.exists(out) or os.path.getsize(out)==0:
-                await status.edit_text("❌ Файл не создался"); return
+    status = await message.reply_text(
+        "⏳ Скачиваю видео..."
+    )
 
-            await status.edit_text("📤 Отправляю...")
-            try:
-                with open(out,"rb") as f:
-                    await msg.reply_video(video=f, caption="✅ Готово!",
-                                          supports_streaming=True)
-                await status.delete()
-            except Exception as e:
-                await status.edit_text(f"❌ Отправка: {e}")
+    with tempfile.TemporaryDirectory() as tmp:
+
+        input_file = os.path.join(
+            tmp,
+            "input.mp4"
+        )
+
+        output_file = os.path.join(
+            tmp,
+            "output.mp4"
+        )
+
+        try:
+
+            telegram_file = await context.bot.get_file(
+                media.file_id
+            )
+
+            await telegram_file.download_to_drive(
+                input_file
+            )
+
+        except Exception as e:
+
+            await status.edit_text(
+                f"❌ Ошибка скачивания:\n{e}"
+            )
+
+            return
+
+        await status.edit_text(
+            "🎬 Обрабатываю видео..."
+        )
+
+        loop = asyncio.get_running_loop()
+
+        try:
+
+            success, result = await loop.run_in_executor(
+                None,
+                process_video,
+                input_file,
+                output_file
+            )
+
+        except Exception as e:
+
+            await status.edit_text(
+                f"❌ Ошибка FFmpeg:\n{e}"
+            )
+
+            return
+
+        if not success:
+
+            await status.edit_text(
+                f"❌ {result}"
+            )
+
+            return
+
+        await status.edit_text(
+            f"📤 Отправляю...\n{result}"
+        )
+
+        try:
+
+            with open(output_file, "rb") as video:
+
+                await message.reply_video(
+                    video=video,
+                    caption="✅ Готово!",
+                    supports_streaming=True,
+                )
+
+            await status.delete()
+
+        except Exception as e:
+
+            await status.edit_text(
+                f"❌ Ошибка отправки:\n{e}"
+            )
 
 
 def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(MessageHandler(filters.VIDEO|filters.Document.VIDEO, handle_video))
+
+    app = (
+        Application
+        .builder()
+        .token(TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "id",
+            get_id
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.VIDEO | filters.Document.VIDEO,
+            handle_video
+        )
+    )
+
     print("✅ Bot started")
+
     app.run_polling()
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
