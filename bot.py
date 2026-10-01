@@ -17,7 +17,7 @@ from telegram.ext import (
 # ВЕРСИЯ — меняй при каждом обновлении, она видна в /start
 # ============================================================
 
-VERSION = "2.0"
+VERSION = "2.1"
 VERSION_DATE = "01.10.2026"
 VERSION_NOTES = (
     "• баннер идёт со своим звуком, без хромакея\n"
@@ -523,6 +523,14 @@ async def get_id(
     )
 
 
+async def set_status(status, text):
+    """Меняет текст статуса; игнорирует «Message is not modified»."""
+    try:
+        await status.edit_text(text)
+    except Exception:
+        pass
+
+
 async def handle_video(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -559,7 +567,7 @@ async def handle_video(
             output_file = os.path.join(tmp, "output.mp4")
 
             try:
-                await status.edit_text("⏳ Скачиваю оригинал...")
+                await set_status(status, "⏳ Скачиваю оригинал...")
 
                 telegram_file = await context.bot.get_file(
                     media.file_id
@@ -568,13 +576,13 @@ async def handle_video(
                 await telegram_file.download_to_drive(input_file)
 
             except Exception as error:
-                await status.edit_text(
+                await set_status(status, 
                     f"❌ Ошибка скачивания:\n{error}"
                 )
                 return
 
             try:
-                await status.edit_text("🎬 Обрабатываю...")
+                await set_status(status, "🎬 Обрабатываю...")
 
                 loop = asyncio.get_running_loop()
 
@@ -586,23 +594,23 @@ async def handle_video(
                 )
 
             except Exception as error:
-                await status.edit_text(
+                await set_status(status, 
                     f"❌ Ошибка обработки:\n{error}"
                 )
                 return
 
             if not ok:
-                await status.edit_text(f"❌ {result}")
+                await set_status(status, f"❌ {result}")
                 return
 
             if os.path.getsize(output_file) > CLOUD_UPLOAD_LIMIT:
-                await status.edit_text(
+                await set_status(status, 
                     "❌ Готовое видео получилось больше 50 МБ — "
                     "Telegram не даёт ботам отправлять файлы крупнее."
                 )
                 return
 
-            await status.edit_text("📤 Отправляю...")
+            await set_status(status, "📤 Отправляю...")
 
             info = probe(output_file) or {}
 
@@ -624,7 +632,7 @@ async def handle_video(
                 await status.delete()
 
             except Exception as error:
-                await status.edit_text(
+                await set_status(status, 
                     f"❌ Ошибка отправки:\n{error}"
                 )
 
