@@ -13,7 +13,6 @@ from telegram.ext import (
     filters,
 )
 
-
 TOKEN = os.environ["BOT_TOKEN"]
 BANNER = "/app/banner.mp4"
 
@@ -23,44 +22,30 @@ ALLOWED_USERS = (
     else set()
 )
 
-SEMAPHORE = asyncio.Semaphore(1)
+LOCK = asyncio.Semaphore(1)
 
-# Длина рекламного баннера.
-# Если banner.mp4 имеет другую длину — она определяется автоматически.
-BANNER_DUR = None
-
-# Качество итогового видео.
-# 18 = высокое качество, значительно лучше старого CRF 28.
 CRF = "18"
-
-# Исходный FPS сохраняется автоматически.
-# Эта переменная используется только для баннера.
-BANNER_FPS = 30
+PRESET = "veryfast"
 
 
 def run(cmd, timeout=7200):
     try:
-        result = subprocess.run(
+        p = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout
         )
-
-        return (
-            result.returncode == 0,
-            result.stderr[-3000:]
-        )
-
+        return p.returncode == 0, p.stderr[-4000:]
     except subprocess.TimeoutExpired:
-        return False, "FFmpeg превысил время обработки"
+        return False, "FFmpeg timeout"
 
 
 def probe(path):
-    result = subprocess.run(
+    p = subprocess.run(
         [
             "ffprobe",
-            "-v", "quiet",
+            "-v", "error",
             "-print_format", "json",
             "-show_streams",
             "-show_format",
@@ -71,20 +56,21 @@ def probe(path):
     )
 
     try:
-        data = json.loads(result.stdout)
+        data = json.loads(p.stdout)
     except Exception:
         return None
 
-    video = None
-    audio = None
+    video = next(
+        (x for x in data.get("streams", [])
+         if x.get("codec_type") == "video"),
+        None
+    )
 
-    for stream in data.get("streams", []):
-
-        if stream.get("codec_type") == "video" and video is None:
-            video = stream
-
-        elif stream.get("codec_type") == "audio" and audio is None:
-            audio = stream
+    audio = next(
+        (x for x in data.get("streams", [])
+         if x.get("codec_type") == "audio"),
+        None
+    )
 
     if not video:
         return None
@@ -95,8 +81,8 @@ def probe(path):
         or 0
     )
 
-    width = int(video.get("width") or 0)
-    height = int(video.get("height") or 0)
+    if duration <= 0:
+        return None
 
     fps_text = (
         video.get("avg_frame_rate")
@@ -107,279 +93,209 @@ def probe(path):
     try:
         a, b = fps_text.split("/")
         fps = float(a) / float(b)
+
         if fps <= 0 or fps > 240:
             fps = 30.0
+
     except Exception:
         fps = 30.0
 
     return {
         "duration": duration,
-        "width": width,
-        "height": height,
+        "width": int(video.get("width") or 0),
+        "height": int(video.get("height") or 0),
         "fps": fps,
         "audio": audio is not None,
-        "video_codec": video.get("codec_name"),
-        "audio_codec": audio.get("codec_name") if audio else None,
     }
 
 
 def get_banner_duration():
-    global BANNER_DUR
+    info = probe(BANNER)
 
-    if BANNER_DUR is not None:
-        return BANNER_DUR
+    if not info:
+        raise RuntimeError(
+            "Не удалось прочитать /app/banner.mp4"
+        )
 
-    data = probe(BANNER)
-
-    if not data:
-        raise RuntimeError("Не удалось прочитать banner.mp4")
-
-    BANNER_DUR = data["duration"]
-
-    if BANNER_DUR <= 0:
-        raise RuntimeError("У banner.mp4 неправильная длительность")
-
-    return BANNER_DUR
+    return info["duration"]
 
 
-def get_banner_positions(duration, banner_duration):
+def get_positions(duration, banner_duration):
     """
-    Логика строго по твоей схеме.
-
-    Видео <= 60 сек:
+    До 60 секунд:
         баннер в середине.
 
-    Видео > 60 сек:
+    Больше 60 секунд:
         00:20
         01:20
         02:20
         03:20
         ...
 
-    Например 15 минут:
-        00:20 ... 14:20
+    Баннер всегда должен проиграться полностью.
     """
 
     if duration <= 60:
-        position = duration / 2
+        return [round(duration / 2, 3)]
 
-        # Если баннер физически не помещается после середины,
-        # ставим его так, чтобы он полностью закончился.
-        if position + banner_duration > duration:
-            position = max(0, duration - banner_duration)
-
-        return [round(position, 3)]
-
-    positions = []
+    result = []
 
     position = 20.0
 
     while position < duration:
 
-        # Баннер должен полностью проиграться.
         if position + banner_duration > duration:
             break
 
-        positions.append(round(position, 3))
+        result.append(round(position, 3))
 
         position += 60.0
 
-    return positions
+    return result
 
 
-def build_filter(width, height, banner_width, banner_height):
-    """
-    Баннер масштабируется относительно исходного видео.
-
-    Он сохраняет пропорции и помещается по центру.
-    """
-
-    x = max(0, (width - banner_width) // 2)
-    y = max(0, (height - banner_height) // 2)
-
-    return (
-        f"[1:v]"
-        f"scale={banner_width}:{banner_height}:"
-        f"force_original_aspect_ratio=decrease,"
-        f"pad={banner_width}:{banner_height}:"
-        f"(ow-iw)/2:(oh-ih)/2:color=black@0,"
-        f"fps={BANNER_FPS},"
-        f"trim=duration={get_banner_duration():.3f},"
-        f"setpts=PTS-STARTPTS,"
-        f"chromakey=0x00FF00:0.30:0.05[banner];"
-
-        f"[0:v]"
-        f"trim=start=0:"
-        f"end={get_banner_duration():.3f},"
-        f"setpts=PTS-STARTPTS[base];"
-
-        f"[base][banner]"
-        f"overlay={x}:{y}:"
-        f"shortest=1,"
-        f"format=yuv420p[v]"
-    )
-
-
-def make_segment_with_banner(
+def make_source_segment(
     source,
-    banner,
     start,
-    end,
+    duration,
     output,
-    width,
-    height,
     fps,
     has_audio
 ):
     """
-    Берёт кусок исходного видео и проигрывает banner.mp4
-    поверх него.
-
-    ЗВУК BANNER НЕ ИСПОЛЬЗУЕТСЯ.
-
-    Оригинальный звук этого участка сохраняется.
+    Обычный кусок исходного видео.
     """
 
-    duration = end - start
-    banner_duration = get_banner_duration()
-
-    # Размер баннера примерно 55% ширины исходника.
-    banner_width = max(
-        320,
-        int(width * 0.55)
-    )
-
-    banner_height = max(
-        180,
-        int(height * 0.30)
-    )
-
-    x = (width - banner_width) // 2
-    y = (height - banner_height) // 2
-
-    filter_complex = (
-        f"[1:v]"
-        f"scale={banner_width}:{banner_height}:"
-        f"force_original_aspect_ratio=decrease,"
-        f"pad={banner_width}:{banner_height}:"
-        f"(ow-iw)/2:(oh-ih)/2:color=black@0,"
-        f"fps={BANNER_FPS},"
-        f"trim=duration={banner_duration:.3f},"
-        f"setpts=PTS-STARTPTS,"
-        f"chromakey=0x00FF00:0.30:0.05[ban];"
-
-        f"[0:v]"
-        f"trim=duration={duration:.3f},"
-        f"setpts=PTS-STARTPTS[base];"
-
-        f"[base][ban]"
-        f"overlay={x}:{y}:shortest=1,"
-        f"format=yuv420p[v]"
-    )
-
-    cmd = [
+    command = [
         "ffmpeg",
         "-y",
 
         "-ss",
         f"{start:.3f}",
 
+        "-i",
+        source,
+
         "-t",
         f"{duration:.3f}",
 
+        "-map",
+        "0:v:0",
+    ]
+
+    if has_audio:
+        command += [
+            "-map",
+            "0:a:0?"
+        ]
+
+    command += [
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        PRESET,
+
+        "-crf",
+        CRF,
+
+        "-r",
+        f"{fps:.6f}",
+
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+    if has_audio:
+        command += [
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "192k",
+
+            "-ar",
+            "48000",
+
+            "-ac",
+            "2",
+        ]
+    else:
+        command += [
+            "-an"
+        ]
+
+    command += [
+        "-avoid_negative_ts",
+        "make_zero",
+
+        output
+    ]
+
+    return run(command)
+
+
+def make_banner_segment(
+    output,
+    duration,
+    width,
+    height,
+    fps
+):
+    """
+    Создаёт отдельный сегмент баннера.
+
+    Звук banner.mp4 НЕ используется.
+
+    После этого сегмента исходное видео
+    продолжается с той же позиции, где
+    был вставлен баннер.
+    """
+
+    filter_complex = (
+        f"[1:v]"
+        f"scale={width}:{height}:"
+        f"force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:"
+        f"(ow-iw)/2:(oh-ih)/2:"
+        f"color=black@0,"
+        f"chromakey=0x00FF00:0.30:0.05,"
+        f"format=yuva420p[ban];"
+
+        f"[0:v][ban]"
+        f"overlay=0:0:shortest=1,"
+        f"format=yuv420p[v]"
+    )
+
+    command = [
+        "ffmpeg",
+        "-y",
+
+        "-f",
+        "lavfi",
+
         "-i",
-        source,
+        (
+            f"color=c=black:"
+            f"s={width}x{height}:"
+            f"r={fps:.6f}:"
+            f"d={duration:.6f}"
+        ),
 
         "-stream_loop",
         "-1",
 
         "-i",
-        banner,
+        BANNER,
 
         "-filter_complex",
         filter_complex,
 
         "-map",
         "[v]",
-    ]
 
-    # ВАЖНО:
-    # берём аудио ТОЛЬКО от исходного видео.
-    # Аудио banner.mp4 вообще не подключается.
-    if has_audio:
-        cmd += [
-            "-map",
-            "0:a:0?",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-        ]
-    else:
-        cmd += [
-            "-an"
-        ]
-
-    cmd += [
-        "-c:v",
-        "libx264",
-
-        "-preset",
-        "veryfast",
-
-        "-crf",
-        CRF,
-
-        "-r",
-        f"{fps:.3f}",
-
-        "-pix_fmt",
-        "yuv420p",
-
-        "-movflags",
-        "+faststart",
-
-        "-avoid_negative_ts",
-        "make_zero",
-
-        "-t",
-        f"{duration:.3f}",
-
-        output
-    ]
-
-    return run(cmd)
-
-
-def make_normal_segment(
-    source,
-    start,
-    end,
-    output,
-    fps,
-    has_audio
-):
-    """
-    Обычный кусок видео без баннера.
-
-    Качество максимально близкое к исходнику.
-    """
-
-    duration = end - start
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-
-        "-ss",
-        f"{start:.3f}",
-
-        "-i",
-        source,
+        # ЗВУК БАННЕРА ПОЛНОСТЬЮ ОТКЛЮЧЕН
+        "-an",
 
         "-t",
         f"{duration:.3f}",
@@ -388,43 +304,16 @@ def make_normal_segment(
         "libx264",
 
         "-preset",
-        "veryfast",
+        PRESET,
 
         "-crf",
         CRF,
 
         "-r",
-        f"{fps:.3f}",
+        f"{fps:.6f}",
 
         "-pix_fmt",
         "yuv420p",
-    ]
-
-    if has_audio:
-        cmd += [
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-        ]
-    else:
-        cmd += [
-            "-map",
-            "0:v:0",
-            "-an"
-        ]
-
-    cmd += [
-        "-movflags",
-        "+faststart",
 
         "-avoid_negative_ts",
         "make_zero",
@@ -432,22 +321,21 @@ def make_normal_segment(
         output
     ]
 
-    return run(cmd)
+    return run(command)
 
 
-def concat_segments(files, output):
-    """
-    Финальная склейка.
-    """
-
+def concat_files(files, output):
     list_file = output + ".txt"
 
-    with open(list_file, "w", encoding="utf-8") as f:
+    with open(
+        list_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
 
-        for file in files:
+        for path in files:
 
-            path = os.path.abspath(file)
-
+            path = os.path.abspath(path)
             path = path.replace("\\", "/")
             path = path.replace("'", "'\\''")
 
@@ -488,16 +376,16 @@ def concat_segments(files, output):
 
 
 def process_video(source, output):
-    """
-    Основная обработка.
-    """
-
     with tempfile.TemporaryDirectory() as tmp:
 
         source_info = probe(source)
+        banner_info = probe(BANNER)
 
         if not source_info:
             return False, "Не удалось прочитать исходное видео"
+
+        if not banner_info:
+            return False, "Не удалось прочитать banner.mp4"
 
         duration = source_info["duration"]
         width = source_info["width"]
@@ -505,21 +393,21 @@ def process_video(source, output):
         fps = source_info["fps"]
         has_audio = source_info["audio"]
 
+        banner_duration = banner_info["duration"]
+
         if duration < 3:
             return False, "Видео слишком короткое"
 
-        if width <= 0 or height <= 0:
-            return False, "Неверное разрешение видео"
+        if banner_duration <= 0:
+            return False, "banner.mp4 пустой"
 
-        banner_duration = get_banner_duration()
-
-        positions = get_banner_positions(
+        positions = get_positions(
             duration,
             banner_duration
         )
 
         if not positions:
-            return False, "Для этого видео баннер не помещается"
+            return False, "Баннер не помещается полностью"
 
         parts = []
 
@@ -527,65 +415,73 @@ def process_video(source, output):
 
         for index, position in enumerate(positions):
 
-            # Кусок ДО баннера.
+            # -----------------------------
+            # ИСХОДНОЕ ВИДЕО ДО БАННЕРА
+            # -----------------------------
+
             if position > current + 0.01:
 
-                normal = os.path.join(
+                segment = os.path.join(
                     tmp,
-                    f"normal_{index}.mp4"
+                    f"source_{index}.mp4"
                 )
 
-                ok, error = make_normal_segment(
+                ok, error = make_source_segment(
                     source,
                     current,
-                    position,
-                    normal,
+                    position - current,
+                    segment,
                     fps,
                     has_audio
                 )
 
                 if not ok:
                     return False, (
-                        f"Ошибка сегмента {index + 1}: "
-                        f"{error}"
+                        f"Ошибка исходного сегмента "
+                        f"{index + 1}: {error}"
                     )
 
-                parts.append(normal)
+                parts.append(segment)
 
-            # Баннер.
-            banner_part = os.path.join(
+            # -----------------------------
+            # ПОЛНЫЙ БАННЕР
+            # -----------------------------
+
+            banner_segment = os.path.join(
                 tmp,
                 f"banner_{index}.mp4"
             )
 
-            banner_end = min(
-                duration,
-                position + banner_duration
-            )
-
-            ok, error = make_segment_with_banner(
-                source,
-                BANNER,
-                position,
-                banner_end,
-                banner_part,
+            ok, error = make_banner_segment(
+                banner_segment,
+                banner_duration,
                 width,
                 height,
-                fps,
-                has_audio
+                fps
             )
 
             if not ok:
                 return False, (
-                    f"Ошибка баннера {index + 1}: "
-                    f"{error}"
+                    f"Ошибка баннера "
+                    f"{index + 1}: {error}"
                 )
 
-            parts.append(banner_part)
+            parts.append(banner_segment)
 
-            current = banner_end
+            # ВАЖНО!
+            #
+            # НЕ position + banner_duration.
+            #
+            # Исходное видео должно продолжиться
+            # с ТОЙ ЖЕ позиции после вставленного
+            # баннера.
 
-        # Последний кусок после последнего баннера.
+            current = position
+
+        # -----------------------------
+        # ИСХОДНОЕ ВИДЕО ПОСЛЕ БАННЕРА
+        # -----------------------------
+
         if current < duration - 0.01:
 
             tail = os.path.join(
@@ -593,10 +489,10 @@ def process_video(source, output):
                 "tail.mp4"
             )
 
-            ok, error = make_normal_segment(
+            ok, error = make_source_segment(
                 source,
                 current,
-                duration,
+                duration - current,
                 tail,
                 fps,
                 has_audio
@@ -610,17 +506,18 @@ def process_video(source, output):
 
             parts.append(tail)
 
-        if not parts:
-            return False, "Не создано ни одного сегмента"
+        # -----------------------------
+        # СКЛЕЙКА
+        # -----------------------------
 
-        ok, error = concat_segments(
+        ok, error = concat_files(
             parts,
             output
         )
 
         if not ok:
             return False, (
-                "Ошибка финальной склейки: "
+                f"Ошибка финальной склейки: "
                 f"{error}"
             )
 
@@ -630,38 +527,40 @@ def process_video(source, output):
         if os.path.getsize(output) == 0:
             return False, "Итоговый файл пустой"
 
+        # Проверяем итоговую длительность.
         result_info = probe(output)
 
         if result_info:
 
             expected = (
-                duration +
-                len(positions) * banner_duration
+                duration
+                + len(positions) * banner_duration
             )
 
             actual = result_info["duration"]
 
-            # Допустимая погрешность из-за кодирования.
             tolerance = max(
-                2.0,
-                len(positions) * 0.15
+                1.0,
+                len(positions) * 0.20
             )
 
             if abs(actual - expected) > tolerance:
 
                 return False, (
-                    f"Неверная длительность. "
-                    f"Ожидалось примерно {expected:.2f} сек, "
-                    f"получилось {actual:.2f} сек."
+                    f"Неверная длительность.\n"
+                    f"Ожидалось примерно "
+                    f"{expected:.2f} сек.\n"
+                    f"Получилось "
+                    f"{actual:.2f} сек."
                 )
 
         return True, (
             f"Готово. "
-            f"Баннеров вставлено: {len(positions)}"
+            f"Баннеров: {len(positions)}"
         )
 
 
-async def cmd_start(
+async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -684,18 +583,17 @@ async def cmd_start(
         "Баннер проигрывается полностью.\n"
         "Звук баннера отключён.\n"
         "Исходный звук видео сохраняется.\n\n"
-        "Ограничения 50 MB и 2 минуты убраны."
+        "Лимита 50 MB и 2 минут нет."
     )
 
 
-async def cmd_id(
+async def get_id(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
     await update.message.reply_text(
-        f"Твой ID: `{update.effective_user.id}`",
-        parse_mode="Markdown"
+        f"Твой ID: {update.effective_user.id}"
     )
 
 
@@ -705,6 +603,7 @@ async def handle_video(
 ):
 
     message = update.message
+
     uid = update.effective_user.id
 
     if ALLOWED_USERS and uid not in ALLOWED_USERS:
@@ -727,7 +626,7 @@ async def handle_video(
         "⏳ Скачиваю оригинал..."
     )
 
-    async with SEMAPHORE:
+    async with LOCK:
 
         with tempfile.TemporaryDirectory() as tmp:
 
@@ -756,7 +655,8 @@ async def handle_video(
             except Exception as error:
 
                 await status.edit_text(
-                    f"❌ Ошибка скачивания:\n{error}"
+                    f"❌ Ошибка скачивания:\n"
+                    f"{error}"
                 )
 
                 return
@@ -765,11 +665,11 @@ async def handle_video(
                 "🎬 Обрабатываю..."
             )
 
-            loop = asyncio.get_running_loop()
-
             try:
 
-                success, result = (
+                loop = asyncio.get_running_loop()
+
+                ok, result = (
                     await loop.run_in_executor(
                         None,
                         process_video,
@@ -781,26 +681,16 @@ async def handle_video(
             except Exception as error:
 
                 await status.edit_text(
-                    f"❌ Ошибка обработки:\n{error}"
+                    f"❌ Ошибка обработки:\n"
+                    f"{error}"
                 )
 
                 return
 
-            if not success:
+            if not ok:
 
                 await status.edit_text(
                     f"❌ {result}"
-                )
-
-                return
-
-            if (
-                not os.path.exists(output_file)
-                or os.path.getsize(output_file) == 0
-            ):
-
-                await status.edit_text(
-                    "❌ Итоговый файл не создан"
                 )
 
                 return
@@ -814,10 +704,10 @@ async def handle_video(
                 with open(
                     output_file,
                     "rb"
-                ) as video_file:
+                ) as video:
 
                     await message.reply_video(
-                        video=video_file,
+                        video=video,
                         caption="✅ Готово!",
                         supports_streaming=True
                     )
@@ -827,34 +717,35 @@ async def handle_video(
             except Exception as error:
 
                 await status.edit_text(
-                    f"❌ Ошибка отправки:\n{error}"
+                    f"❌ Ошибка отправки:\n"
+                    f"{error}"
                 )
 
 
 def main():
 
-    application = (
+    app = (
         Application
         .builder()
         .token(TOKEN)
         .build()
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "start",
-            cmd_start
+            start
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "id",
-            cmd_id
+            get_id
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
             filters.VIDEO
             | filters.Document.VIDEO,
@@ -864,7 +755,7 @@ def main():
 
     print("✅ Bot started")
 
-    application.run_polling()
+    app.run_polling()
 
 
 if __name__ == "__main__":
