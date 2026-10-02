@@ -17,10 +17,11 @@ from telegram.ext import (
 # ВЕРСИЯ — меняй при каждом обновлении, она видна в /start
 # ============================================================
 
-VERSION = "2.3"
+VERSION = "2.4"
 VERSION_DATE = "01.10.2026"
 VERSION_NOTES = (
-    "• баннер идёт со своим звуком, без хромакея\n"
+    "• зелёный фон баннера вырезается, баннер встаёт на ролик\n"
+    "• баннер идёт со своим звуком\n"
     "• ролик стоит на стоп-кадре, пока играет баннер\n"
     "• после баннера ролик продолжается с того же места\n"
     "• баннеры на 1:20, 2:20, 3:20 и так далее\n"
@@ -39,6 +40,10 @@ ALLOWED_USERS = {
     for x in os.environ.get("ALLOWED_USERS", "").split(",")
     if x.strip()
 }
+
+# Цвет зелёного фона в banner.mp4 — он вырезается (хромакей баннера).
+# Если поменяешь баннер на другой с другим фоном — поменяй цвет здесь.
+BANNER_KEY_COLOR = "0x22872A"
 
 # Прозрачность баннера в процентах (0 = совсем непрозрачный).
 # По рекомендации поста — 10. Хочешь меньше/больше — меняй число.
@@ -323,16 +328,23 @@ def make_banner_segment(
         ]
 
     transparency = min(max(BANNER_TRANSPARENCY, 0), 100)
-    alpha = ""
+    alpha = ",format=rgba"
 
     if transparency > 0:
         opacity = 1 - transparency / 100
-        alpha = f",format=rgba,colorchannelmixer=aa={opacity:.3f}"
+        alpha += f",colorchannelmixer=aa={opacity:.3f}"
+
+    # Сначала вырезаем зелёный фон баннера (при его родном размере),
+    # потом уже масштабируем.
+    key = (
+        f"colorkey=color={BANNER_KEY_COLOR}:similarity=0.12:blend=0.03,"
+        f"despill=type=green:mix=0.5:expand=0,"
+    )
 
     filter_complex = (
         f"[0:v]tpad=stop_mode=clone:stop_duration={d},"
         f"fps={fps:.6f},setsar=1[base];"
-        f"[1:v]scale={width}:{height}:"
+        f"[1:v]{key}scale={width}:{height}:"
         f"force_original_aspect_ratio=decrease,"
         f"setsar=1{alpha}[ban];"
         f"[base][ban]overlay="
