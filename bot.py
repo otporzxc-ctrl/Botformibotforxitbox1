@@ -1,8 +1,12 @@
 import os
 import json
+import time
+import socket
+import shutil
 import asyncio
 import tempfile
 import subprocess
+import urllib.request
 
 from telegram import Update
 from telegram.ext import (
@@ -17,7 +21,7 @@ from telegram.ext import (
 # ВЕРСИЯ — меняй при каждом обновлении, она видна в /start
 # ============================================================
 
-VERSION = "2.4"
+VERSION = "2.6"
 VERSION_DATE = "01.10.2026"
 VERSION_NOTES = (
     "• зелёный фон баннера вырезается, баннер встаёт на ролик\n"
@@ -25,7 +29,8 @@ VERSION_NOTES = (
     "• ролик стоит на стоп-кадре, пока играет баннер\n"
     "• после баннера ролик продолжается с того же места\n"
     "• баннеры на 1:20, 2:20, 3:20 и так далее\n"
-    "• прозрачность баннера 10%"
+    "• прозрачность баннера 10%\n"
+    "• видео до 500 МБ (локальный Bot API)"
 )
 
 # ============================================================
@@ -54,8 +59,21 @@ BANNER_TRANSPARENCY = 10
 FIRST_BANNER_AT = 80.0
 BANNER_STEP = 60.0
 
-CLOUD_DOWNLOAD_LIMIT = 20 * 1024 * 1024
-CLOUD_UPLOAD_LIMIT = 50 * 1024 * 1024
+# Максимальный размер входного видео, когда включён локальный Bot API.
+# Ограничение нужно только чтобы не забить диск Railway.
+MAX_FILE_MB = 500
+
+# Локальный Bot API сервер (снимает лимиты Telegram 20 МБ / 50 МБ).
+# Включается, если заданы TELEGRAM_API_ID и TELEGRAM_API_HASH.
+API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
+LOCAL_PORT = 8081
+LOCAL_DIR = "/var/lib/telegram-bot-api"
+LOCAL_TMP = "/tmp/telegram-bot-api"
+TG_API_BIN = "/usr/local/bin/telegram-bot-api"
+
+LOCAL_MODE = False
+
 
 LOCK = asyncio.Semaphore(1)
 
@@ -536,8 +554,92 @@ def process_video(source, output):
 
 
 # ============================================================
+# ЛОКАЛЬНЫЙ BOT API (снимает лимиты Telegram)
+# ============================================================
+
+def start_local_server():
+    if not (API_ID and API_HASH):
+        print(
+            "ℹ️ TELEGRAM_API_ID / TELEGRAM_API_HASH не заданы — "
+            "работаю через облачный Bot API (лимиты 20/50 МБ)",
+            flush=True
+        )
+        return None
+
+    if not os.path.exists(TG_API_BIN):
+        print(
+            "⚠️ telegram-bot-api не найден в образе — "
+            "работаю через облачный Bot API",
+            flush=True
+        )
+        return None
+
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    os.makedirs(LOCAL_TMP, exist_ok=True)
+
+    proc = subprocess.Popen([
+        TG_API_BIN,
+        f"--api-id={API_ID}",
+        f"--api-hash={API_HASH}",
+        "--local",
+        f"--http-port={LOCAL_PORT}",
+        f"--dir={LOCAL_DIR}",
+        f"--temp-dir={LOCAL_TMP}",
+    ])
+
+    for _ in range(60):
+        if proc.poll() is not None:
+            print(
+                "❌ telegram-bot-api сразу завершился "
+                "(проверь TELEGRAM_API_ID / TELEGRAM_API_HASH)",
+                flush=True
+            )
+            return None
+
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", LOCAL_PORT),
+                timeout=1
+            ):
+                print("✅ Локальный Bot API запущен", flush=True)
+                return proc
+        except OSError:
+            time.sleep(0.5)
+
+    proc.terminate()
+    print("❌ Локальный Bot API не поднялся за 30 секунд", flush=True)
+    return None
+
+
+def logout_from_cloud():
+    """
+    Чтобы бот мог работать через локальный сервер, его надо
+    один раз «разлогинить» из облачного Bot API.
+    Если уже разлогинен — ничего не делает.
+    """
+    base = f"https://api.telegram.org/bot{TOKEN}"
+
+    try:
+        urllib.request.urlopen(f"{base}/getMe", timeout=20).read()
+    except Exception:
+        return
+
+    try:
+        urllib.request.urlopen(f"{base}/logOut", timeout=20).read()
+        print("✅ Бот разлогинен из облачного Bot API", flush=True)
+    except Exception as error:
+        print(f"⚠️ logOut из облака не удался: {error}", flush=True)
+
+
+# ============================================================
 # ХЕНДЛЕРЫ
 # ============================================================
+
+def mode_text():
+    if LOCAL_MODE:
+        return f"локальный Bot API — видео до {MAX_FILE_MB} МБ"
+    return "облачный Bot API (Telegram может не отдать файлы больше 20 МБ)"
+
 
 async def start(
     update: Update,
@@ -557,7 +659,8 @@ async def start(
         "пока ролик стоит на стоп-кадре. "
         "Потом ролик продолжается с того же места.\n\n"
         f"🔖 Версия: v{VERSION} от {VERSION_DATE}\n"
-        f"{VERSION_NOTES}"
+        f"{VERSION_NOTES}\n\n"
+        f"⚙️ Режим: {mode_text()}"
     )
 
 
@@ -596,10 +699,22 @@ async def handle_video(
 
     size = getattr(media, "file_size", None) or 0
 
-    if size > CLOUD_DOWNLOAD_LIMIT:
+    if LOCAL_MODE:
+        if size > MAX_FILE_MB * 1024 * 1024:
+            await message.reply_text(
+                f"❌ Файл больше {MAX_FILE_MB} МБ — "
+                f"такое бот не берёт, чтобы не забить диск сервера."
+            )
+            return
+
+    # Нужно место: исходник + куски + результат.
+    free = shutil.disk_usage(tempfile.gettempdir()).free
+
+    if size and free < size * 3:
         await message.reply_text(
-            "❌ Файл больше 20 МБ — Telegram не отдаёт "
-            "ботам файлы крупнее."
+            f"❌ На сервере не хватает места: нужно около "
+            f"{size * 3 // (1024 * 1024)} МБ, свободно "
+            f"{free // (1024 * 1024)} МБ."
         )
         return
 
@@ -612,20 +727,47 @@ async def handle_video(
         with tempfile.TemporaryDirectory() as tmp:
             input_file = os.path.join(tmp, "input.mp4")
             output_file = os.path.join(tmp, "output.mp4")
+            server_copy = None
 
             try:
                 await set_status(status, "⏳ Скачиваю оригинал...")
 
+                # Локальный сервер сначала сам скачивает файл —
+                # для больших видео это может занять время.
                 telegram_file = await context.bot.get_file(
-                    media.file_id
+                    media.file_id,
+                    read_timeout=3600
                 )
 
-                await telegram_file.download_to_drive(input_file)
+                path = telegram_file.file_path or ""
+
+                if (
+                    LOCAL_MODE
+                    and os.path.isabs(path)
+                    and os.path.isfile(path)
+                ):
+                    # Файл уже лежит на диске сервера —
+                    # копировать не нужно, читаем прямо оттуда.
+                    input_file = path
+                    server_copy = path
+                else:
+                    await telegram_file.download_to_drive(input_file)
 
             except Exception as error:
-                await set_status(status, 
-                    f"❌ Ошибка скачивания:\n{error}"
-                )
+                if "too big" in str(error).lower():
+                    await set_status(
+                        status,
+                        "❌ Telegram не отдаёт боту этот файл — "
+                        "он больше 20 МБ, а обычный Bot API такое "
+                        "не пускает.\n"
+                        "Нужен локальный Bot API "
+                        "(TELEGRAM_API_ID и TELEGRAM_API_HASH в Railway)."
+                    )
+                else:
+                    await set_status(
+                        status,
+                        f"❌ Ошибка скачивания:\n{error}"
+                    )
                 return
 
             try:
@@ -641,20 +783,21 @@ async def handle_video(
                 )
 
             except Exception as error:
-                await set_status(status, 
+                await set_status(
+                    status,
                     f"❌ Ошибка обработки:\n{error}"
                 )
                 return
 
+            finally:
+                if server_copy:
+                    try:
+                        os.remove(server_copy)
+                    except OSError:
+                        pass
+
             if not ok:
                 await set_status(status, f"❌ {result}")
-                return
-
-            if os.path.getsize(output_file) > CLOUD_UPLOAD_LIMIT:
-                await set_status(status, 
-                    "❌ Готовое видео получилось больше 50 МБ — "
-                    "Telegram не даёт ботам отправлять файлы крупнее."
-                )
                 return
 
             await set_status(status, "📤 Отправляю...")
@@ -662,38 +805,71 @@ async def handle_video(
             info = probe(output_file) or {}
 
             try:
-                with open(output_file, "rb") as video:
+                send_kwargs = dict(
+                    caption=f"✅ Готово! (v{VERSION})",
+                    supports_streaming=True,
+                    duration=int(info.get("duration") or 0) or None,
+                    width=info.get("width") or None,
+                    height=info.get("height") or None,
+                    read_timeout=3600,
+                    write_timeout=3600,
+                    connect_timeout=60,
+                    pool_timeout=60,
+                )
+
+                if LOCAL_MODE:
+                    # PTB в локальном режиме передаёт серверу путь
+                    # к файлу, без загрузки через HTTP.
                     await message.reply_video(
-                        video=video,
-                        caption=f"✅ Готово! (v{VERSION})",
-                        supports_streaming=True,
-                        duration=int(info.get("duration") or 0) or None,
-                        width=info.get("width") or None,
-                        height=info.get("height") or None,
-                        read_timeout=600,
-                        write_timeout=600,
-                        connect_timeout=60,
-                        pool_timeout=60,
+                        video=output_file,
+                        **send_kwargs
                     )
+                else:
+                    with open(output_file, "rb") as video:
+                        await message.reply_video(
+                            video=video,
+                            **send_kwargs
+                        )
 
                 await status.delete()
 
             except Exception as error:
-                await set_status(status, 
+                await set_status(
+                    status,
                     f"❌ Ошибка отправки:\n{error}"
                 )
 
 
 def main():
+    global LOCAL_MODE
+
     print(f"🔖 MusorDrop bot v{VERSION} ({VERSION_DATE})", flush=True)
 
-    app = (
+    server = start_local_server()
+
+    builder = (
         Application
         .builder()
         .token(TOKEN)
         .concurrent_updates(True)
-        .build()
+        .connect_timeout(30)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(30)
     )
+
+    if server:
+        logout_from_cloud()
+        LOCAL_MODE = True
+
+        builder = (
+            builder
+            .base_url(f"http://127.0.0.1:{LOCAL_PORT}/bot")
+            .base_file_url(f"http://127.0.0.1:{LOCAL_PORT}/file/bot")
+            .local_mode(True)
+        )
+
+    app = builder.build()
 
     app.add_handler(CommandHandler(["start", "version"], start))
     app.add_handler(CommandHandler("id", get_id))
@@ -704,7 +880,7 @@ def main():
         )
     )
 
-    print("✅ Bot started", flush=True)
+    print(f"✅ Bot started. Режим: {mode_text()}", flush=True)
 
     app.run_polling()
 
