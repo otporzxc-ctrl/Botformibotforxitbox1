@@ -17,7 +17,7 @@ from telegram.ext import (
 # ВЕРСИЯ — меняй при каждом обновлении, она видна в /start
 # ============================================================
 
-VERSION = "2.1"
+VERSION = "2.2"
 VERSION_DATE = "01.10.2026"
 VERSION_NOTES = (
     "• баннер идёт со своим звуком, без хромакея\n"
@@ -61,6 +61,15 @@ EVEN = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 # ============================================================
 
 def run(cmd, timeout=7200):
+    if cmd and cmd[0] == "ffmpeg":
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostats",
+            "-nostdin",
+        ] + cmd[1:]
+
     try:
         p = subprocess.run(
             cmd,
@@ -68,9 +77,19 @@ def run(cmd, timeout=7200):
             text=True,
             timeout=timeout
         )
-        return p.returncode == 0, p.stderr[-4000:]
     except subprocess.TimeoutExpired:
         return False, "FFmpeg timeout"
+
+    if p.returncode == 0:
+        return True, ""
+
+    if p.returncode < 0:
+        return False, (
+            f"ffmpeg убит системой (сигнал {-p.returncode}) — "
+            f"скорее всего не хватило памяти на сервере"
+        )
+
+    return False, p.stderr.strip()[-1500:]
 
 
 def probe(path):
@@ -209,6 +228,7 @@ def make_source_segment(
     """
     command = [
         "ffmpeg", "-y",
+        "-threads", "4",
         "-ss", f"{start:.3f}",
         "-i", source,
     ]
@@ -216,15 +236,16 @@ def make_source_segment(
     if not has_audio:
         command += [
             "-f", "lavfi",
-            "-i", "anullsrc=r=48000:cl=stereo",
+            "-i", f"anullsrc=r=48000:cl=stereo:d={duration + 1:.3f}",
         ]
 
     command += [
         "-map", "0:v:0",
         "-map", "0:a:0" if has_audio else "1:a:0",
         "-vf", EVEN,
-        "-af", "aresample=48000,apad",
+        "-af", f"aresample=48000,apad=whole_dur={duration:.3f}",
         "-t", f"{duration:.3f}",
+        "-threads", "4",
         "-c:v", "libx264",
         "-preset", PRESET,
         "-crf", CRF,
@@ -263,6 +284,7 @@ def make_banner_segment(
     # Стоп-кадр без потери цвета (без перегонки в RGB).
     ok, error = run([
         "ffmpeg", "-y",
+        "-threads", "4",
         "-ss", f"{position:.3f}",
         "-i", source,
         "-map", "0:v:0",
@@ -292,7 +314,7 @@ def make_banner_segment(
     if not banner_has_audio:
         command += [
             "-f", "lavfi",
-            "-i", "anullsrc=r=48000:cl=stereo",
+            "-i", f"anullsrc=r=48000:cl=stereo:d={banner_duration + 1:.3f}",
         ]
 
     filter_complex = (
@@ -310,8 +332,9 @@ def make_banner_segment(
         "-filter_complex", filter_complex,
         "-map", "[v]",
         "-map", "1:a:0" if banner_has_audio else "2:a:0",
-        "-af", "aresample=48000,apad",
+        "-af", f"aresample=48000,apad=whole_dur={d}",
         "-t", d,
+        "-threads", "4",
         "-c:v", "libx264",
         "-preset", PRESET,
         "-crf", CRF,
